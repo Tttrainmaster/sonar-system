@@ -1,0 +1,258 @@
+/*
+  Pan-tilt sonar scanner
+  Stepper (28BYJ-48)  -> horizontal spin (PAN)
+  Servo               -> vertical tilt of the sonar mount (TILT)
+  HC-SR04             -> distance sensor on top
+  Joystick HW-504     -> manual takeover of both axes
+  LCD 16x2 (I2C)      -> shows mode, pan angle, tilt angle, distance
+
+  Pins:
+    Stepper driver IN1-IN4 : 8, 9, 10, 11
+    Sonar Trig / Echo      : 7 / 6
+    Joystick X / Y / SW    : A0 / A1 / A2
+    Servo signal           : 5
+    LCD I2C SDA / SCL      : A4 / A5
+
+  Joystick button toggles AUTO <-> MANUAL.
+  Do not touch the joystick while powering on (it calibrates its center).
+*/
+
+#include <AccelStepper.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <Servo.h>
+
+// ======================= PINS =======================
+const int TRIG_PIN  = 7;
+const int ECHO_PIN  = 6;
+const int JOY_X     = A0;
+const int JOY_Y     = A1;
+const int JOY_SW    = A2;
+const int SERVO_PIN = 5;
+
+// ======================= SETTINGS (tune these) =======================
+// true  = keep spinning 360 degrees in one direction
+// false = sweep back and forth between SWEEP_MIN_DEG and SWEEP_MAX_DEG
+const bool FULL_SPIN = true;
+const int  SWEEP_MIN_DEG = -90;
+const int  SWEEP_MAX_DEG = 90;
+
+const int  AUTO_SPEED       = 400;   // steps/second in auto mode (~35 deg/s)
+const int  MANUAL_MAX_SPEED = 600;   // steps/second at full joystick push
+
+// Servo angles for "parallel to board" and "perpendicular"
+const int  TILT_MIN = 0;
+const int  TILT_MAX = 90;
+
+// Flip these if a joystick direction feels backwards
+const bool INVERT_PAN  = false;
+const bool INVERT_TILT = false;
+
+const int  DEADZONE = 60;            // joystick ignore zone around center
+const long STEPS_PER_REV = 4096;     // 28BYJ-48 in half-step mode
+
+// ======================= OBJECTS =======================
+AccelStepper stepper(AccelStepper::HALF4WIRE, 8, 10, 9, 11);  // order IN1, IN3, IN2, IN4
+LiquidCrystal_I2C lcd(0x27, 16, 2);                           // use 0x3F if screen stays blank
+Servo tiltServo;
+
+// ======================= STATE =======================
+bool autoMode = true;
+int  autoDir = 1;                    // +1 or -1
+int  tiltAngle = TILT_MIN;
+float distanceCm = -1;               // -1 means "no echo"
+int  centerX = 512, centerY = 512;   // joystick resting values
+bool coilsOn = true;
+
+unsigned long lastPress = 0;
+unsigned long lastTilt  = 0;
+unsigned long lastSense = 0;
+unsigned long lastLcd   = 100;       // offset so sonar and LCD updates don't collide
+unsigned long lastMove  = 0;
+
+// Values currently shown on the LCD (so only changes are redrawn)
+int shownMode = -1, shownPan = -1, shownTilt = -1, shownDist = -2;
+
+// ======================= HELPERS =======================
+
+// Distance in cm, or -1 if no echo came back
+float readDistance() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH, 25000);   // give up after 25 ms (~4 m)
+  if (duration == 0) return -1;
+  return duration * 0.0343 / 2;
+}
+
+// Joystick reading relative to center, 0 inside the dead zone
+int joyOffset(int pin, int center) {
+  int o = analogRead(pin) - center;
+  if (abs(o) < DEADZONE) return 0;
+  return o;
+}
+
+// Pan angle 0-359 (0 = where the sensor pointed at power-on)
+int getPanDeg() {
+  long pos = stepper.currentPosition() % STEPS_PER_REV;
+  if (pos < 0) pos += STEPS_PER_REV;
+  return (int)((pos * 360L) / STEPS_PER_REV);
+}
+
+// Print a number as exactly 3 digits (007, 045, 123)
+void print3(int v) {
+  if (v < 100) lcd.print('0');
+  if (v < 10)  lcd.print('0');
+  lcd.print(v);
+}
+
+// Print a number right-aligned in 3 characters (  7,  45, 123)
+void printPad3(int v) {
+  if (v < 100) lcd.print(' ');
+  if (v < 10)  lcd.print(' ');
+  lcd.print(v);
+}
+
+// Redraw only the parts of the screen that changed (keeps the stepper smooth)
+void updateLCD() {
+  int modeNow = autoMode ? 1 : 0;
+  if (modeNow != shownMode) {
+    shownMode = modeNow;
+    lcd.setCursor(0, 0);
+    lcd.print(autoMode ? "AUTO" : "MAN ");
+  }
+
+  int panDeg = getPanDeg();
+  if (panDeg != shownPan) {
+    shownPan = panDeg;
+    lcd.setCursor(6, 0);
+    print3(panDeg);
+  }
+
+  if (tiltAngle != shownTilt) {
+    shownTilt = tiltAngle;
+    lcd.setCursor(11, 0);
+    print3(tiltAngle);
+  }
+
+  int distNow = (distanceCm < 0) ? -1 : (int)(distanceCm + 0.5);
+  if (distNow != shownDist) {
+    shownDist = distNow;
+    lcd.setCursor(5, 1);
+    if (distNow < 0) lcd.print("---");
+    else printPad3(distNow);
+  }
+}
+
+// ======================= SETUP =======================
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(JOY_SW, INPUT_PULLUP);
+
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("Sonar scanner");
+  lcd.setCursor(0, 1);
+  lcd.print("Calibrating...");
+
+  // Learn the joystick's resting center (average of 20 readings)
+  long sx = 0, sy = 0;
+  for (int i = 0; i < 20; i++) {
+    sx += analogRead(JOY_X);
+    sy += analogRead(JOY_Y);
+    delay(5);
+  }
+  centerX = sx / 20;
+  centerY = sy / 20;
+
+  stepper.setMaxSpeed(1000);
+
+  tiltServo.attach(SERVO_PIN);
+  tiltServo.write(tiltAngle);
+
+  delay(800);
+
+  // Draw the fixed labels once; updateLCD() fills in the numbers
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("AUTO P000 T000");
+  lcd.setCursor(0, 1);
+  lcd.print("Dist:--- cm");
+}
+
+// ======================= LOOP =======================
+void loop() {
+  unsigned long now = millis();
+
+  // ---- 1. Button: toggle AUTO / MANUAL ----
+  if (digitalRead(JOY_SW) == LOW && now - lastPress > 300) {
+    lastPress = now;
+    autoMode = !autoMode;
+  }
+
+  int xo = joyOffset(JOY_X, centerX);
+  int yo = joyOffset(JOY_Y, centerY);
+  int panSpeed = 0;
+
+  if (autoMode) {
+    // ---- 2a. AUTO: constant horizontal scan, tilt holds its angle ----
+    if (!FULL_SPIN) {
+      float posDeg = stepper.currentPosition() * 360.0 / STEPS_PER_REV;
+      if (autoDir > 0 && posDeg >= SWEEP_MAX_DEG) autoDir = -1;
+      else if (autoDir < 0 && posDeg <= SWEEP_MIN_DEG) autoDir = 1;
+    }
+    panSpeed = autoDir * AUTO_SPEED;
+
+  } else {
+    // ---- 2b. MANUAL: joystick X = pan speed, joystick Y = tilt angle ----
+    panSpeed = constrain((long)xo * MANUAL_MAX_SPEED / 512, -MANUAL_MAX_SPEED, MANUAL_MAX_SPEED);
+    if (INVERT_PAN) panSpeed = -panSpeed;
+
+    if (now - lastTilt > 30 && yo != 0) {
+      lastTilt = now;
+      int step = map(abs(yo), DEADZONE, 512, 1, 3);   // push further = faster
+      step = constrain(step, 1, 3);
+      if (yo < 0) step = -step;
+      if (INVERT_TILT) step = -step;
+      tiltAngle = constrain(tiltAngle + step, TILT_MIN, TILT_MAX);
+      tiltServo.write(tiltAngle);
+    }
+  }
+
+  // ---- 3. Drive the stepper ----
+  if (panSpeed != 0) {
+    if (!coilsOn) {
+      stepper.enableOutputs();
+      coilsOn = true;
+    }
+    lastMove = now;
+    stepper.setSpeed(panSpeed);
+    stepper.runSpeed();                 // call as often as possible
+  } else if (coilsOn && now - lastMove > 2000) {
+    stepper.disableOutputs();           // idle 2 s: coils off so the motor stays cool
+    coilsOn = false;
+  }
+
+  // ---- 4. Slow tasks: only one per loop pass, so the stepper keeps stepping ----
+  if (now - lastSense >= 200) {
+    lastSense = now;
+    distanceCm = readDistance();
+
+    // CSV line: pan,tilt,distance (useful if you want to plot a map later)
+    Serial.print(getPanDeg());
+    Serial.print(',');
+    Serial.print(tiltAngle);
+    Serial.print(',');
+    Serial.println(distanceCm, 1);
+  } else if (now - lastLcd >= 200) {
+    lastLcd = now;
+    updateLCD();
+  }
+}
